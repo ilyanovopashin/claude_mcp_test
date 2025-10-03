@@ -1,0 +1,15 @@
+{
+  "name": "mcp-chatmi-proxy",
+  "version": "1.0.0",
+  "description": "SSE proxy between MCP client and Chatmi service",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@vercel/node": "^3.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
