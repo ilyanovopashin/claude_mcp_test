@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/sse.ts": {
+      "maxDuration": 60
+    }
+  }
+}
