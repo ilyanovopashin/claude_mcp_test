@@ -2,6 +2,9 @@
   "functions": {
     "api/sse.ts": {
       "maxDuration": 60
+    },
+    "api/message.ts": {
+      "maxDuration": 60
     }
   }
 }
