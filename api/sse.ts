@@ -1,8 +1,11 @@
-// api/sse.ts - Vercel serverless function
+// api/sse.ts - SSE connection endpoint
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 const CHATMI_ENDPOINT = process.env.CHATMI_ENDPOINT || 
   'https://admin.chatme.ai/connector/webim/webim_message/a7e28b914256ab13395ec974e7bb9548/bot_api_webhook';
+
+// In-memory store for pending requests (NOTE: Won't work across Vercel instances)
+const pendingRequests = new Map<string, any>();
 
 interface MCPRequest {
   jsonrpc: '2.0';
@@ -22,48 +25,6 @@ interface MCPResponse {
   };
 }
 
-interface ChatmiRequest {
-  event: 'new_message';
-  chat: { id: string };
-  text: string;
-}
-
-interface ChatmiResponse {
-  has_answer: boolean;
-  messages: Array<{
-    kind: string;
-    text: string;
-  }>;
-}
-
-async function callChatmi(inputString: string): Promise<string> {
-  const payload: ChatmiRequest = {
-    event: 'new_message',
-    chat: { id: 'mcp-session' },
-    text: inputString
-  };
-
-  const response = await fetch(CHATMI_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Chatmi API error: ${response.status} ${response.statusText}`);
-  }
-
-  const data: ChatmiResponse = await response.json();
-  
-  if (data.has_answer && data.messages.length > 0) {
-    return data.messages[0].text;
-  }
-  
-  throw new Error('No response from Chatmi');
-}
-
 function createSSEMessage(data: string): string {
   return `data: ${data}\n\n`;
 }
@@ -71,7 +32,7 @@ function createSSEMessage(data: string): string {
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Set CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   
   // Handle preflight
@@ -79,10 +40,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).end();
   }
 
-  // Only accept POST requests
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+  // Only accept GET requests for SSE
+  if (req.method !== 'GET') {
+    return res.status(405).json({ error: 'Method not allowed. Use GET for SSE connection.' });
   }
+
+  const sessionId = (req.query.session as string) || 'default';
+  
+  console.log(`[SSE Connected] Session: ${sessionId}`);
 
   // Set up SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -90,78 +55,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
-  try {
-    const mcpRequest: MCPRequest = req.body;
+  // Send initial connection event
+  res.write(createSSEMessage(JSON.stringify({
+    type: 'connection',
+    sessionId,
+    timestamp: new Date().toISOString()
+  })));
 
-    console.log('[MCP Request]', JSON.stringify(mcpRequest));
+  // Store this connection
+  pendingRequests.set(sessionId, res);
 
-    // Validate JSON-RPC format
-    if (mcpRequest.jsonrpc !== '2.0' || !mcpRequest.method) {
-      console.error('[Validation Error] Invalid MCP request format');
-      const errorResponse: MCPResponse = {
-        jsonrpc: '2.0',
-        id: mcpRequest.id || null,
-        error: {
-          code: -32600,
-          message: 'Invalid Request'
-        }
-      };
-      res.write(createSSEMessage(JSON.stringify(errorResponse)));
-      return res.end();
-    }
+  // Keep-alive ping every 15 seconds
+  const keepAliveInterval = setInterval(() => {
+    res.write(':ping\n\n');
+  }, 15000);
 
-    // Convert MCP request to Chatmi INPUT_STRING format (stringified JSON)
-    const inputObject = {
-      method: mcpRequest.method,
-      params: mcpRequest.params || {},
-      id: mcpRequest.id
-    };
-    const inputString = JSON.stringify(inputObject);
+  // Clean up after 50 seconds (Vercel limit is 60s)
+  const timeout = setTimeout(() => {
+    console.log(`[SSE Timeout] Session: ${sessionId}`);
+    clearInterval(keepAliveInterval);
+    pendingRequests.delete(sessionId);
+    res.end();
+  }, 50000);
 
-    console.log('[Chatmi Input]', inputString);
-
-    // Call Chatmi synchronously
-    const outputString = await callChatmi(inputString);
-
-    console.log('[Chatmi Output]', outputString);
-
-    // Parse Chatmi's OUTPUT_STRING
-    let result: any;
-    try {
-      const parsed = JSON.parse(outputString);
-      result = parsed;
-    } catch (parseError) {
-      console.error('[Parse Error]', parseError);
-      // If not JSON, treat as plain result
-      result = outputString;
-    }
-
-    // Create MCP response
-    const mcpResponse: MCPResponse = {
-      jsonrpc: '2.0',
-      id: mcpRequest.id,
-      result
-    };
-
-    console.log('[MCP Response]', JSON.stringify(mcpResponse));
-
-    // Send as SSE event
-    res.write(createSSEMessage(JSON.stringify(mcpResponse)));
-    
-  } catch (error) {
-    console.error('[Error]', error);
-    const errorResponse: MCPResponse = {
-      jsonrpc: '2.0',
-      id: (req.body as MCPRequest)?.id || null,
-      error: {
-        code: -32603,
-        message: error instanceof Error ? error.message : 'Internal error'
-      }
-    };
-    res.write(createSSEMessage(JSON.stringify(errorResponse)));
-  }
-
-  res.end();
+  // Handle client disconnect
+  req.on('close', () => {
+    console.log(`[SSE Disconnected] Session: ${sessionId}`);
+    clearInterval(keepAliveInterval);
+    clearTimeout(timeout);
+    pendingRequests.delete(sessionId);
+  });
 }
 
 export const config = {
